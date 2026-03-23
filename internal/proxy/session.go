@@ -146,6 +146,32 @@ func normalizeSessionSystemContent(content string) string {
 	return strings.TrimSpace(strings.Join(filtered, "\n"))
 }
 
+func normalizeSessionUserContent(content string) string {
+	if content == "" {
+		return ""
+	}
+	return strings.TrimSpace(stripSystemReminders(content))
+}
+
+func isMeaningfulUserMessage(msg ChatMessage) bool {
+	return msg.Role == "user" && msg.ToolCallID == "" && normalizeSessionUserContent(msg.Content) != ""
+}
+
+func shouldCountNonSystemMessage(msg ChatMessage) bool {
+	switch msg.Role {
+	case "system":
+		return false
+	case "user":
+		return isMeaningfulUserMessage(msg)
+	case "assistant":
+		return strings.TrimSpace(msg.Content) != "" || len(msg.ToolCalls) > 0
+	case "tool":
+		return strings.TrimSpace(msg.Content) != "" || msg.ToolCallID != "" || msg.Name != ""
+	default:
+		return strings.TrimSpace(msg.Content) != ""
+	}
+}
+
 // computeSessionFingerprintWithSalt generates a fingerprint from the message history
 // to identify the same conversation across Anthropic API requests.
 // Strategy: hash(optional stable salt + normalized system prompt prefix + first user message prefix).
@@ -169,8 +195,8 @@ func computeSessionFingerprintWithSalt(messages []ChatMessage, stableSalt string
 	}
 	// Include first user message
 	for _, m := range messages {
-		if m.Role == "user" {
-			content := m.Content
+		if isMeaningfulUserMessage(m) {
+			content := normalizeSessionUserContent(m.Content)
 			if len(content) > 200 {
 				content = content[:200]
 			}
@@ -191,7 +217,7 @@ func computeSessionFingerprint(messages []ChatMessage) string {
 func countUserMessages(messages []ChatMessage) int {
 	count := 0
 	for _, m := range messages {
-		if m.Role == "user" {
+		if isMeaningfulUserMessage(m) {
 			count++
 		}
 	}
@@ -204,7 +230,7 @@ func countUserMessages(messages []ChatMessage) int {
 func countNonSystemMessages(messages []ChatMessage) int {
 	count := 0
 	for _, m := range messages {
-		if m.Role != "system" {
+		if shouldCountNonSystemMessage(m) {
 			count++
 		}
 	}
@@ -214,8 +240,8 @@ func countNonSystemMessages(messages []ChatMessage) int {
 // extractLastUserMessage returns the content of the last user message.
 func extractLastUserMessage(messages []ChatMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			return messages[i].Content
+		if isMeaningfulUserMessage(messages[i]) {
+			return normalizeSessionUserContent(messages[i].Content)
 		}
 	}
 	return ""
@@ -228,7 +254,7 @@ func extractLastUserMessage(messages []ChatMessage) string {
 func needsFreshThreadRecovery(messages []ChatMessage) bool {
 	lastUserIdx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" && messages[i].ToolCallID == "" {
+		if isMeaningfulUserMessage(messages[i]) {
 			lastUserIdx = i
 			break
 		}
@@ -237,8 +263,7 @@ func needsFreshThreadRecovery(messages []ChatMessage) bool {
 		return false
 	}
 	for i := 0; i < lastUserIdx; i++ {
-		switch messages[i].Role {
-		case "user", "assistant", "tool":
+		if shouldCountNonSystemMessage(messages[i]) {
 			return true
 		}
 	}
@@ -261,7 +286,7 @@ func buildFreshThreadRecoveryMessages(messages []ChatMessage) []ChatMessage {
 
 	lastUserIdx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" && messages[i].ToolCallID == "" {
+		if isMeaningfulUserMessage(messages[i]) {
 			lastUserIdx = i
 			break
 		}
@@ -298,6 +323,9 @@ func buildFreshThreadRecoveryMessages(messages []ChatMessage) []ChatMessage {
 		}
 
 		content := strings.TrimSpace(m.Content)
+		if m.Role == "user" {
+			content = normalizeSessionUserContent(m.Content)
+		}
 		if content == "" && m.Role != "assistant" && m.Role != "user" {
 			continue
 		}
@@ -337,7 +365,7 @@ func buildFreshThreadRecoveryMessages(messages []ChatMessage) []ChatMessage {
 		history.WriteString(reversed[i].content)
 	}
 
-	latest := strings.TrimSpace(messages[lastUserIdx].Content)
+	latest := normalizeSessionUserContent(messages[lastUserIdx].Content)
 
 	var prompt strings.Builder
 	prompt.WriteString("Continue this conversation on a fresh thread.\n")

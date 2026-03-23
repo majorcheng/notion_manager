@@ -504,9 +504,6 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 			if messages[i].Role == "user" || messages[i].Role == "tool" {
 				orig := messages[i].Content
 				cleaned := stripSystemReminders(orig)
-				if strings.TrimSpace(cleaned) == "" {
-					cleaned = "Hello"
-				}
 				if len(cleaned) != len(orig) {
 					log.Printf("[bridge] [%d] sanitized user message (%d → %d chars)", i, len(orig), len(cleaned))
 				}
@@ -529,6 +526,8 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 					log.Printf("[bridge] extracted CWD from system prompt: %s", extractedCwd)
 				}
 				log.Printf("[bridge] dropped system message (%d chars)", len(m.Content))
+			} else if m.Role == "user" && strings.TrimSpace(m.Content) == "" && m.ToolCallID == "" && len(m.ToolCalls) == 0 {
+				log.Printf("[bridge] dropped empty wrapper-only user message after sanitization")
 			} else {
 				filtered = append(filtered, m)
 			}
