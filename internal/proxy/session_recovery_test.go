@@ -28,6 +28,30 @@ func TestNeedsFreshThreadRecoverySkipsSingleTurn(t *testing.T) {
 	}
 }
 
+func TestNeedsFreshThreadRecoveryIgnoresWrapperOnlyUserMessage(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "system", Content: "You are Claude Code."},
+		{Role: "user", Content: "<available-deferred-tools>\nRead\nEdit\n</available-deferred-tools>"},
+		{Role: "user", Content: "修复登录校验"},
+	}
+
+	if needsFreshThreadRecovery(messages) {
+		t.Fatal("expected wrapper-only user message to be ignored for recovery collapse")
+	}
+}
+
+func TestCountNonSystemMessagesIgnoresWrapperOnlyUserMessage(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "system", Content: "You are Claude Code."},
+		{Role: "user", Content: "<available-deferred-tools>\nRead\nEdit\n</available-deferred-tools>"},
+		{Role: "user", Content: "修复登录校验"},
+	}
+
+	if got := countNonSystemMessages(messages); got != 1 {
+		t.Fatalf("expected wrapper-only user message to be excluded from raw count, got %d", got)
+	}
+}
+
 func TestBuildFreshThreadRecoveryMessagesCollapsesHistory(t *testing.T) {
 	messages := []ChatMessage{
 		{Role: "system", Content: "Answer in Chinese."},

@@ -82,3 +82,35 @@ func TestApplyStructuredOutputBridge_JSONSchema(t *testing.T) {
 		t.Fatalf("structured output bridge did not embed schema JSON: %s", content)
 	}
 }
+
+func TestInjectToolsIntoMessages_DropsWrapperOnlyUserMessage(t *testing.T) {
+	tools := []Tool{
+		{Type: "function", Function: ToolFunction{Name: "Bash", Description: "Execute shell command", Parameters: map[string]interface{}{"type": "object"}}},
+		{Type: "function", Function: ToolFunction{Name: "Read", Description: "Read a file", Parameters: map[string]interface{}{"type": "object"}}},
+		{Type: "function", Function: ToolFunction{Name: "Write", Description: "Write a file", Parameters: map[string]interface{}{"type": "object"}}},
+		{Type: "function", Function: ToolFunction{Name: "Edit", Description: "Edit a file", Parameters: map[string]interface{}{"type": "object"}}},
+		{Type: "function", Function: ToolFunction{Name: "Glob", Description: "Find files", Parameters: map[string]interface{}{"type": "object"}}},
+		{Type: "function", Function: ToolFunction{Name: "Grep", Description: "Search files", Parameters: map[string]interface{}{"type": "object"}}},
+	}
+	messages := []ChatMessage{
+		{Role: "system", Content: "You are Claude Code."},
+		{Role: "user", Content: "<available-deferred-tools>\nRead\nEdit\n</available-deferred-tools>"},
+		{Role: "user", Content: "修复登录校验"},
+	}
+
+	got := injectToolsIntoMessages(messages, tools, "claude-opus-4-6", nil)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 bridged message, got %d", len(got))
+	}
+
+	content := got[0].Content
+	if strings.Contains(content, "User: Hello") || strings.Contains(content, "\nHello\n") {
+		t.Fatalf("wrapper-only message should not turn into synthetic Hello: %q", content)
+	}
+	if strings.Contains(content, "<available-deferred-tools>") {
+		t.Fatalf("wrapper-only message leaked into bridged content: %q", content)
+	}
+	if !strings.Contains(content, `Input: "修复登录校验"`) {
+		t.Fatalf("expected actual user query in bridged content, got %q", content)
+	}
+}
