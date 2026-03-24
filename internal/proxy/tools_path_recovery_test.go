@@ -299,3 +299,122 @@ func TestNormalizeToolCallPaths_DoesNotRewriteDotPath(t *testing.T) {
 		t.Fatalf("dot-path grep should not be rewritten, got %s", got[0].Function.Arguments)
 	}
 }
+
+func TestBuildSessionChainFollowUp_EditRecoveryHintUsesExactReadBlock(t *testing.T) {
+	messages := []ChatMessage{
+		{
+			Role:    "system",
+			Content: "<system-reminder>\n% pwd\n/mnt/d/code/check_alive.py\n</system-reminder>",
+		},
+		{Role: "user", Content: "修正 @chatgpt_register.py ，汇报给tg的内容，“结果文件：” 这个不用带"},
+		{
+			Role:    "assistant",
+			Content: "I'll inspect and edit the file.",
+			ToolCalls: []ToolCall{
+				{ID: "call_read", Type: "function", Function: ToolCallFunction{Name: "Read", Arguments: `{"file_path":"chatgpt_register.py","offset":5030,"limit":80}`}},
+				{ID: "call_edit", Type: "function", Function: ToolCallFunction{Name: "Edit", Arguments: "{\"file_path\":\"chatgpt_register.py\",\"old_str\":\"    output_file = str(summary.get(\\\"output_file\\\") or \\\"\\\").strip()\\n    if output_file:\\n        lines.append(f\\\"结果文件：{output_file}\\\")\\n\",\"new_str\":\"\"}"}},
+			},
+		},
+		{
+			Role:       "tool",
+			ToolCallID: "call_read",
+			Name:       "Read",
+			Content:    "    output_file = str(summary.get(\"output_file\") or \"\").strip()\n    if output_file:\n        lines.append(f\"结果文件：<code>{html.escape(output_file)}</code>\")\n\n    lines.append(\n<system-reminder>[Showing lines 5031-5080 of 5234 total lines]</system-reminder>",
+		},
+		{
+			Role:       "tool",
+			ToolCallID: "call_edit",
+			Name:       "Edit",
+			Content:    "Error: Error: The text to replace was not found in the file. Please ensure the old_str parameter matches the exact text in the file, including whitespace and line breaks.",
+		},
+	}
+
+	got := buildSessionChainFollowUp(messages, "- Read(file_path: str, offset?: num, limit?: num)\n- Edit(old_str: str, new_str: str, file_path: str)\n- Grep(pattern: str, path?: str)\n", "")
+	if len(got) != 1 {
+		t.Fatalf("expected single follow-up message, got %d", len(got))
+	}
+	body := got[0].Content
+	for _, want := range []string{
+		"Edit recovery hint:",
+		"Do NOT paraphrase or simplify old_str",
+		`<code>{html.escape(output_file)}</code>`,
+		`"name":"Edit"`,
+		`/mnt/d/code/check_alive.py/chatgpt_register.py`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected follow-up to contain %q, got: %s", want, body)
+		}
+	}
+}
+
+func TestInjectToolsIntoMessages_EditRecoveryHintPreservesInlineCodeTags(t *testing.T) {
+	tools := []Tool{
+		{Type: "function", Function: ToolFunction{Name: "Bash", Description: "Execute shell command", Parameters: map[string]interface{}{"type": "object"}}},
+		{Type: "function", Function: ToolFunction{Name: "Read", Description: "Read a file", Parameters: map[string]interface{}{"type": "object"}}},
+		{Type: "function", Function: ToolFunction{Name: "Edit", Description: "Edit a file", Parameters: map[string]interface{}{"type": "object"}}},
+		{Type: "function", Function: ToolFunction{Name: "Write", Description: "Write a file", Parameters: map[string]interface{}{"type": "object"}}},
+		{Type: "function", Function: ToolFunction{Name: "Glob", Description: "Find paths", Parameters: map[string]interface{}{"type": "object"}}},
+		{Type: "function", Function: ToolFunction{Name: "Grep", Description: "Search file content", Parameters: map[string]interface{}{"type": "object"}}},
+	}
+	messages := []ChatMessage{
+		{
+			Role:    "system",
+			Content: "<system-reminder>\n% pwd\n/mnt/d/code/check_alive.py\n</system-reminder>",
+		},
+		{Role: "user", Content: "修正 @chatgpt_register.py ，汇报给tg的内容，“结果文件：” 这个不用带"},
+		{
+			Role:    "assistant",
+			Content: "I'll inspect the file.",
+			ToolCalls: []ToolCall{
+				{ID: "call_read", Type: "function", Function: ToolCallFunction{Name: "Read", Arguments: `{"file_path":"./chatgpt_register.py","offset":5030,"limit":80}`}},
+			},
+		},
+		{
+			Role:       "tool",
+			ToolCallID: "call_read",
+			Name:       "Read",
+			Content:    "    output_file = str(summary.get(\"output_file\") or \"\").strip()\n    if output_file:\n        lines.append(f\"结果文件：<code>{html.escape(output_file)}</code>\")\n\n    lines.append(\n<system-reminder>[Showing lines 5031-5080 of 5234 total lines]</system-reminder>",
+		},
+		{
+			Role:    "assistant",
+			Content: "I'll remove that field.",
+			ToolCalls: []ToolCall{
+				{ID: "call_edit", Type: "function", Function: ToolCallFunction{Name: "Edit", Arguments: "{\"file_path\":\"./chatgpt_register.py\",\"old_str\":\"    output_file = str(summary.get(\\\"output_file\\\") or \\\"\\\").strip()\\n    if output_file:\\n        lines.append(f\\\"结果文件：{output_file}\\\")\\n\",\"new_str\":\"\"}"}},
+			},
+		},
+		{
+			Role:       "tool",
+			ToolCallID: "call_edit",
+			Name:       "Edit",
+			Content:    "Error: Error: The text to replace was not found in the file. Please ensure the old_str parameter matches the exact text in the file, including whitespace and line breaks.",
+		},
+		{
+			Role:    "assistant",
+			Content: "I'll grep for the exact text.",
+			ToolCalls: []ToolCall{
+				{ID: "call_grep", Type: "function", Function: ToolCallFunction{Name: "Grep", Arguments: `{"pattern":"output_file.*结果文件","path":"./chatgpt_register.py","multiline":true}`}},
+			},
+		},
+		{Role: "tool", ToolCallID: "call_grep", Name: "Grep", Content: "chatgpt_register.py"},
+	}
+
+	got := injectToolsIntoMessages(messages, tools, "sonnet-4.6", nil)
+	if len(got) != 1 {
+		t.Fatalf("expected collapsed single follow-up message, got %d", len(got))
+	}
+	body := got[0].Content
+	for _, want := range []string{
+		"Edit recovery hint:",
+		"only returned a path, not editable source lines",
+		`<code>{html.escape(output_file)}</code>`,
+		`"name":"Edit"`,
+		`/mnt/d/code/check_alive.py/chatgpt_register.py`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected collapsed prompt to contain %q, got: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "[Showing lines 5031-5080") {
+		t.Fatalf("system reminder wrapper should be stripped from tool result, got: %s", body)
+	}
+}

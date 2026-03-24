@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -396,8 +397,13 @@ var (
 	envVarLikeRegex      = regexp.MustCompile(`(?:^|[\x00\n])(?:[A-Z][A-Z0-9_]{1,40})=`)
 )
 
-func stripSystemReminders(content string) string {
+func stripSystemReminderBlocks(content string) string {
 	content = blockTagRegex.ReplaceAllString(content, "")
+	return strings.Trim(content, "\n")
+}
+
+func stripSystemReminders(content string) string {
+	content = stripSystemReminderBlocks(content)
 	content = inlineTagRegex.ReplaceAllString(content, "")
 	return strings.TrimSpace(content)
 }
@@ -621,6 +627,381 @@ func sanitizeToolResultForFollowUp(name, content string) (string, bool, bool) {
 	return content, needsReadNarrowing, false
 }
 
+func buildToolCallMap(messages []ChatMessage) map[string]ToolCall {
+	tcMap := make(map[string]ToolCall)
+	for _, msg := range messages {
+		for _, tc := range msg.ToolCalls {
+			tcMap[tc.ID] = tc
+		}
+	}
+	return tcMap
+}
+
+func parseToolCallArgs(tc ToolCall) (map[string]interface{}, bool) {
+	argsJSON := strings.TrimSpace(tc.Function.Arguments)
+	if argsJSON == "" || !json.Valid([]byte(argsJSON)) {
+		return nil, false
+	}
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return nil, false
+	}
+	return args, true
+}
+
+func marshalJSONNoEscape(v interface{}) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(buf.String())
+}
+
+func toolArgString(args map[string]interface{}, key string) string {
+	raw, ok := args[key].(string)
+	if !ok {
+		return ""
+	}
+	return raw
+}
+
+func toolArgBool(args map[string]interface{}, key string) (bool, bool) {
+	raw, ok := args[key]
+	if !ok {
+		return false, false
+	}
+	val, ok := raw.(bool)
+	return val, ok
+}
+
+func toolArgInt(args map[string]interface{}, key string) (int, bool) {
+	raw, ok := args[key]
+	if !ok {
+		return 0, false
+	}
+	switch v := raw.(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	default:
+		return 0, false
+	}
+}
+
+func isEditOldStrNotFound(content string) bool {
+	lower := strings.ToLower(content)
+	return strings.Contains(lower, "text to replace was not found in the file") ||
+		strings.Contains(lower, "old_str parameter matches the exact text in the file")
+}
+
+func splitLinesKeepNewline(text string) []string {
+	if text == "" {
+		return nil
+	}
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	lines := strings.SplitAfter(text, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func trimBlankEdgeLines(lines []string) []string {
+	start := 0
+	for start < len(lines) && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+	end := len(lines)
+	for end > start && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	return lines[start:end]
+}
+
+func trimTrailingNewline(line string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+}
+
+func countNonBlankLines(lines []string) int {
+	count := 0
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func extractExactEditBlockFromRead(readContent string, oldStr string) (string, int, int, bool) {
+	readLines := trimBlankEdgeLines(splitLinesKeepNewline(stripSystemReminderBlocks(readContent)))
+	oldLines := trimBlankEdgeLines(splitLinesKeepNewline(oldStr))
+	if len(readLines) == 0 || len(oldLines) == 0 {
+		return "", 0, 0, false
+	}
+
+	trimmedOld := strings.Join(oldLines, "")
+	if strings.Contains(strings.Join(readLines, ""), trimmedOld) {
+		return trimmedOld, len(oldLines), countNonBlankLines(oldLines), true
+	}
+
+	bestScore := 0
+	bestCandidate := ""
+	bestNonBlank := 0
+	ambiguous := false
+
+	for i := 0; i < len(readLines); i++ {
+		if trimTrailingNewline(readLines[i]) != trimTrailingNewline(oldLines[0]) {
+			continue
+		}
+
+		prefixExact := 0
+		for prefixExact < len(oldLines) && i+prefixExact < len(readLines) {
+			if trimTrailingNewline(readLines[i+prefixExact]) != trimTrailingNewline(oldLines[prefixExact]) {
+				break
+			}
+			prefixExact++
+		}
+		if prefixExact == 0 {
+			continue
+		}
+
+		blockLen := prefixExact
+		if prefixExact < len(oldLines) && i+prefixExact < len(readLines) {
+			blockLen++
+		}
+		if i+blockLen > len(readLines) {
+			continue
+		}
+
+		candidate := strings.Join(readLines[i:i+blockLen], "")
+		nonBlank := countNonBlankLines(readLines[i : i+blockLen])
+		if prefixExact > bestScore {
+			bestScore = prefixExact
+			bestCandidate = candidate
+			bestNonBlank = nonBlank
+			ambiguous = false
+			continue
+		}
+		if prefixExact == bestScore && prefixExact > 0 && candidate != bestCandidate {
+			ambiguous = true
+		}
+	}
+
+	minRequired := 1
+	if countNonBlankLines(oldLines) > 1 {
+		minRequired = 2
+	}
+	if bestScore < minRequired || ambiguous {
+		return "", bestScore, bestNonBlank, false
+	}
+	return bestCandidate, bestScore, bestNonBlank, true
+}
+
+func hasPathOnlyGrepAfter(messages []ChatMessage, lastAssistantIdx int, resolveName func(ChatMessage) string) bool {
+	for i, msg := range messages {
+		if msg.Role != "tool" || i <= lastAssistantIdx || resolveName(msg) != "Grep" {
+			continue
+		}
+		if _, ok := extractSinglePathCandidate(msg.Content); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func buildEditRetryGuidance(messages []ChatMessage, lastAssistantIdx int, cwd string, resolveName func(ChatMessage) string) string {
+	tcMap := buildToolCallMap(messages)
+	taggedPaths := extractTaggedFilePathsFromMessages(messages)
+	pathOnlyGrep := hasPathOnlyGrepAfter(messages, lastAssistantIdx, resolveName)
+
+	type readSnapshot struct {
+		FilePath string
+		Content  string
+		Offset   int
+		Limit    int
+		HasRange bool
+	}
+	type candidate struct {
+		FilePath     string
+		OldStr       string
+		NewStr       string
+		ChangeAll    bool
+		HasChangeAll bool
+		ExactOldStr  string
+		PrefixScore  int
+		OldLineCount int
+		ReadSnapshot *readSnapshot
+		MessageIndex int
+	}
+
+	findReadSnapshot := func(filePath string) *readSnapshot {
+		for i := len(messages) - 1; i >= 0; i-- {
+			msg := messages[i]
+			if msg.Role != "tool" || resolveName(msg) != "Read" {
+				continue
+			}
+			tc, ok := tcMap[msg.ToolCallID]
+			if !ok {
+				continue
+			}
+			args, ok := parseToolCallArgs(tc)
+			if !ok {
+				continue
+			}
+			readFile := toolArgString(args, "file_path")
+			if readFile == "" {
+				continue
+			}
+			resolved := resolveToolPathCandidate(readFile, cwd, taggedPaths)
+			if resolved == "" {
+				resolved = readFile
+			}
+			if resolved != filePath {
+				continue
+			}
+			snapshot := &readSnapshot{
+				FilePath: resolved,
+				Content:  msg.Content,
+			}
+			if offset, ok := toolArgInt(args, "offset"); ok {
+				snapshot.Offset = offset
+				snapshot.HasRange = true
+			}
+			if limit, ok := toolArgInt(args, "limit"); ok {
+				snapshot.Limit = limit
+				snapshot.HasRange = true
+			}
+			return snapshot
+		}
+		return nil
+	}
+
+	var best *candidate
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != "tool" || resolveName(msg) != "Edit" || !isEditOldStrNotFound(msg.Content) {
+			continue
+		}
+		tc, ok := tcMap[msg.ToolCallID]
+		if !ok {
+			continue
+		}
+		args, ok := parseToolCallArgs(tc)
+		if !ok {
+			continue
+		}
+
+		filePath := toolArgString(args, "file_path")
+		oldStr := toolArgString(args, "old_str")
+		newStr := toolArgString(args, "new_str")
+		if filePath == "" || oldStr == "" {
+			continue
+		}
+
+		resolved := resolveToolPathCandidate(filePath, cwd, taggedPaths)
+		if resolved == "" {
+			resolved = filePath
+		}
+
+		snapshot := findReadSnapshot(resolved)
+		exactOldStr := ""
+		prefixScore := 0
+		oldLineCount := 0
+		if snapshot != nil {
+			if exact, prefix, nonBlank, ok := extractExactEditBlockFromRead(snapshot.Content, oldStr); ok {
+				exactOldStr = exact
+				prefixScore = prefix
+				oldLineCount = nonBlank
+			} else {
+				prefixScore = prefix
+				oldLineCount = nonBlank
+			}
+		}
+
+		changeAll, hasChangeAll := toolArgBool(args, "change_all")
+		current := &candidate{
+			FilePath:     resolved,
+			OldStr:       oldStr,
+			NewStr:       newStr,
+			ChangeAll:    changeAll,
+			HasChangeAll: hasChangeAll,
+			ExactOldStr:  exactOldStr,
+			PrefixScore:  prefixScore,
+			OldLineCount: oldLineCount,
+			ReadSnapshot: snapshot,
+			MessageIndex: i,
+		}
+
+		if best == nil {
+			best = current
+			continue
+		}
+		if current.PrefixScore > best.PrefixScore {
+			best = current
+			continue
+		}
+		if current.PrefixScore < best.PrefixScore {
+			continue
+		}
+
+		currentWhitespaceOnly := strings.TrimSpace(current.NewStr) == ""
+		bestWhitespaceOnly := strings.TrimSpace(best.NewStr) == ""
+		if currentWhitespaceOnly && !bestWhitespaceOnly {
+			best = current
+			continue
+		}
+		if currentWhitespaceOnly == bestWhitespaceOnly && current.OldLineCount > 0 && best.OldLineCount > 0 && current.OldLineCount < best.OldLineCount {
+			best = current
+			continue
+		}
+		if current.MessageIndex > best.MessageIndex {
+			best = current
+		}
+	}
+
+	if best == nil {
+		return ""
+	}
+
+	var hint strings.Builder
+	hint.WriteString("Edit recovery hint: the previous Edit failed because old_str did not exactly match the file. ")
+	if pathOnlyGrep {
+		hint.WriteString("The latest Grep result only returned a path, not editable source lines, so do NOT keep using Grep to recover old_str. ")
+	}
+	hint.WriteString("Reuse the exact text from the most recent Read result for the same file. Do NOT paraphrase or simplify old_str. Preserve exact whitespace, braces, and inline tags such as <code>...</code>.\n")
+
+	if best.ExactOldStr != "" {
+		args := map[string]interface{}{
+			"file_path": best.FilePath,
+			"old_str":   best.ExactOldStr,
+			"new_str":   best.NewStr,
+		}
+		if best.HasChangeAll {
+			args["change_all"] = best.ChangeAll
+		}
+		call := map[string]interface{}{
+			"name":      "Edit",
+			"arguments": args,
+		}
+		payload := marshalJSONNoEscape(call)
+		hint.WriteString("Prefer this next call:\n")
+		hint.WriteString(payload)
+		hint.WriteString("\n")
+		return hint.String()
+	}
+
+	if best.ReadSnapshot != nil {
+		hint.WriteString("If the exact replacement block is still unclear, prefer another Read on the same file around the latest known region instead of Grep.\n")
+		return hint.String()
+	}
+
+	hint.WriteString("If needed, call Read on the same file again before retrying Edit.\n")
+	return hint.String()
+}
+
 func looksLikeResolvedPath(candidate string) bool {
 	if candidate == "" {
 		return false
@@ -710,7 +1091,7 @@ func buildReadRetryGuidance(messages []ChatMessage, lastAssistantIdx int, cwd st
 				"file_path": absolutePath,
 			},
 		}
-		payload, _ := json.Marshal(call)
+		payload := marshalJSONNoEscape(call)
 		reason := "the previous Read failed because it required an absolute path."
 		switch {
 		case hasAbsFailure && hasSuspiciousRead:
@@ -720,7 +1101,7 @@ func buildReadRetryGuidance(messages []ChatMessage, lastAssistantIdx int, cwd st
 		}
 		return fmt.Sprintf(
 			"Path recovery hint: %s The latest %s result looks like a file path, not file contents (%s). Do NOT use __done__ yet. Prefer this next call:\n%s\n",
-			reason, toolName, pathCandidate, string(payload),
+			reason, toolName, pathCandidate, payload,
 		)
 	}
 
@@ -832,11 +1213,16 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 		// 3. Filter to core tools only (keep injection small)
 		// 4. Append subtle action hints (not "unit test" or "CLI router" — those get refused)
 
-		// Strip Claude Code-specific tags from user AND tool messages
+		// Strip Claude Code-specific tags from user messages, and only remove
+		// block wrappers from tool messages so code snippets like
+		// <code>{html.escape(...)}</code> survive exact-match recovery.
 		for i := range messages {
 			if messages[i].Role == "user" || messages[i].Role == "tool" {
 				orig := messages[i].Content
 				cleaned := stripSystemReminders(orig)
+				if messages[i].Role == "tool" {
+					cleaned = stripSystemReminderBlocks(orig)
+				}
 				if len(cleaned) != len(orig) {
 					log.Printf("[bridge] [%d] sanitized user message (%d → %d chars)", i, len(orig), len(cleaned))
 				}
@@ -1000,9 +1386,10 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 				readGuardLine = "The previous Read call was too large. Do NOT repeat the same full-file Read. Use Grep to narrow scope or call Read with both offset and limit.\n"
 			}
 			readRetryLine := buildReadRetryGuidance(messages, lastAssistantIdx, extractedCwd, resolveName)
+			editRetryLine := buildEditRetryGuidance(messages, lastAssistantIdx, extractedCwd, resolveName)
 			collapsed := fmt.Sprintf(
 				"I'm writing a unit test for an API router.\n%s%s%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\n\nAlready executed (do NOT re-run):\n%s\n\nInput: \"%s\"\n\nIf the results above answer the input, output: {\"name\": \"__done__\", \"arguments\": {\"result\": \"natural language answer based on results\"}}\nOtherwise output the JSON for the NEXT DIFFERENT function call.",
-				cwdLine, readGuardLine, readRetryLine, compactList, dataStr, userQuery)
+				cwdLine, readGuardLine, readRetryLine+editRetryLine, compactList, dataStr, userQuery)
 			log.Printf("[bridge] chain: collapsed %d messages to single message (%d chars)", len(messages), len(collapsed))
 			return []ChatMessage{{Role: "user", Content: collapsed}}
 		}
@@ -1327,10 +1714,11 @@ func buildSessionChainFollowUp(messages []ChatMessage, compactList string, cwd s
 		readGuardLine = "The previous Read call was too large. Do NOT repeat the same full-file Read. Use Grep to narrow scope or call Read with both offset and limit.\n"
 	}
 	readRetryLine := buildReadRetryGuidance(messages, lastAssistantIdx, cwd, resolveName)
+	editRetryLine := buildEditRetryGuidance(messages, lastAssistantIdx, cwd, resolveName)
 
 	followUp := fmt.Sprintf(
 		"Results from executed function(s):\n%s\n\n%s%s%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nIf these results answer the question, use __done__. Otherwise output the next function call.",
-		results.String(), cwdLine, readGuardLine, readRetryLine, compactList)
+		results.String(), cwdLine, readGuardLine, readRetryLine+editRetryLine, compactList)
 
 	log.Printf("[bridge] session chain: follow-up for partial transcript (%d chars, %d tool results)",
 		len(followUp), resultCount)
