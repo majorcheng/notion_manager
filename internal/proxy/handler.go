@@ -5,10 +5,25 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+const publicModelCreatedAt = int64(1735689600)
+
+type publicModelResponse struct {
+	Object string        `json:"object"`
+	Data   []publicModel `json:"data"`
+}
+
+type publicModel struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
 
 // HandleHealth returns an HTTP handler for the /health endpoint
 func HandleHealth(pool *AccountPool) http.HandlerFunc {
@@ -22,6 +37,74 @@ func HandleHealth(pool *AccountPool) http.HandlerFunc {
 		}
 		json.NewEncoder(w).Encode(resp)
 	}
+}
+
+// HandlePublicModels returns an OpenAI-compatible models list for API clients.
+func HandlePublicModels(pool *AccountPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, `{"error":{"message":"method not allowed","type":"invalid_request_error"}}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		resp := publicModelResponse{
+			Object: "list",
+			Data:   buildPublicModels(pool.AllModels()),
+		}
+		json.NewEncoder(w).Encode(resp)
+	}
+}
+
+func buildPublicModels(models []ModelEntry) []publicModel {
+	seen := make(map[string]bool, len(models))
+	items := make([]publicModel, 0, len(models))
+	for _, model := range models {
+		id := publicModelID(model)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		items = append(items, publicModel{
+			ID:      id,
+			Object:  "model",
+			Created: publicModelCreatedAt,
+			OwnedBy: "notion-manager",
+		})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].ID < items[j].ID
+	})
+	return items
+}
+
+func publicModelID(model ModelEntry) string {
+	if normalized := normalizeModelName(model.Name); normalized != "" {
+		return normalized
+	}
+	return friendlyModelNameByInternalID(model.ID)
+}
+
+func friendlyModelNameByInternalID(id string) string {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return ""
+	}
+
+	candidates := make([]string, 0, 1)
+	for friendly, internalID := range DefaultModelMap {
+		if internalID == trimmed {
+			candidates = append(candidates, friendly)
+		}
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	sort.Strings(candidates)
+	return candidates[0]
 }
 
 // HandleAdminAccounts returns detailed account info including models, quota, and status
