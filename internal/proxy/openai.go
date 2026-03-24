@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"net/http/httptest"
@@ -439,15 +440,21 @@ func (t *openAIResponsesStreamTranscoder) ensureCreated() error {
 		return nil
 	}
 	t.createdSent = true
-	return t.emit("response.created", map[string]interface{}{
-		"response": map[string]interface{}{
-			"id":         t.responseID,
-			"object":     "response",
-			"created_at": t.created,
-			"status":     "in_progress",
-			"model":      t.model,
-			"output":     []interface{}{},
-		},
+	respObj := map[string]interface{}{
+		"id":         t.responseID,
+		"object":     "response",
+		"created_at": t.created,
+		"status":     "in_progress",
+		"model":      t.model,
+		"output":     []interface{}{},
+	}
+	if err := t.emit("response.created", map[string]interface{}{
+		"response": respObj,
+	}); err != nil {
+		return err
+	}
+	return t.emit("response.in_progress", map[string]interface{}{
+		"response": respObj,
 	})
 }
 
@@ -462,7 +469,7 @@ func (t *openAIResponsesStreamTranscoder) ensureMessageItem() error {
 	t.messageIndex = t.nextOutputIndex
 	t.nextOutputIndex++
 	t.messageItemID = "msg_" + compactUUID()
-	return t.emit("response.output_item.added", map[string]interface{}{
+	if err := t.emit("response.output_item.added", map[string]interface{}{
 		"response_id":  t.responseID,
 		"output_index": t.messageIndex,
 		"item": map[string]interface{}{
@@ -475,6 +482,19 @@ func (t *openAIResponsesStreamTranscoder) ensureMessageItem() error {
 				"text":        "",
 				"annotations": []interface{}{},
 			}},
+		},
+	}); err != nil {
+		return err
+	}
+	return t.emit("response.content_part.added", map[string]interface{}{
+		"response_id":  t.responseID,
+		"item_id":      t.messageItemID,
+		"output_index": t.messageIndex,
+		"content_index": 0,
+		"part": map[string]interface{}{
+			"type":        "output_text",
+			"text":        "",
+			"annotations": []interface{}{},
 		},
 	})
 }
@@ -523,11 +543,27 @@ func (t *openAIResponsesStreamTranscoder) finalizeMessageItem() error {
 	if !t.messageStarted {
 		return nil
 	}
+	finalText := t.messageText.String()
 	if err := t.emit("response.output_text.done", map[string]interface{}{
 		"response_id":   t.responseID,
+		"item_id":       t.messageItemID,
 		"output_index":  t.messageIndex,
 		"content_index": 0,
-		"text":          t.messageText.String(),
+		"text":          finalText,
+	}); err != nil {
+		return err
+	}
+	contentPart := map[string]interface{}{
+		"type":        "output_text",
+		"text":        finalText,
+		"annotations": []interface{}{},
+	}
+	if err := t.emit("response.content_part.done", map[string]interface{}{
+		"response_id":   t.responseID,
+		"item_id":       t.messageItemID,
+		"output_index":  t.messageIndex,
+		"content_index": 0,
+		"part":          contentPart,
 	}); err != nil {
 		return err
 	}
@@ -535,15 +571,11 @@ func (t *openAIResponsesStreamTranscoder) finalizeMessageItem() error {
 		"response_id":  t.responseID,
 		"output_index": t.messageIndex,
 		"item": map[string]interface{}{
-			"id":     t.messageItemID,
-			"type":   "message",
-			"status": "completed",
-			"role":   "assistant",
-			"content": []map[string]interface{}{{
-				"type":        "output_text",
-				"text":        t.messageText.String(),
-				"annotations": []interface{}{},
-			}},
+			"id":      t.messageItemID,
+			"type":    "message",
+			"status":  "completed",
+			"role":    "assistant",
+			"content": []map[string]interface{}{contentPart},
 		},
 	})
 }
@@ -635,6 +667,7 @@ func (t *openAIResponsesStreamTranscoder) HandleFrame(frame anthropicSSEFrame) e
 			t.messageText.WriteString(text)
 			return t.emit("response.output_text.delta", map[string]interface{}{
 				"response_id":   t.responseID,
+				"item_id":       t.messageItemID,
 				"output_index":  t.messageIndex,
 				"content_index": 0,
 				"delta":         text,
@@ -693,6 +726,7 @@ func HandleOpenAIChatCompletions(pool *AccountPool) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusBadRequest, "request body is required", "invalid_request_error", "")
 			return
 		}
+		log.Printf("[openai-chat] incoming /v1/chat/completions request (%d bytes)", len(bodyBytes))
 		LogAPIInputJSONBytes("openai-chat", "incoming /v1/chat/completions request", bodyBytes)
 
 		var req OpenAIChatCompletionRequest
@@ -743,6 +777,7 @@ func HandleOpenAIResponses(pool *AccountPool) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusBadRequest, "request body is required", "invalid_request_error", "")
 			return
 		}
+		log.Printf("[openai-resp] incoming /v1/responses request (%d bytes)", len(bodyBytes))
 		LogAPIInputJSONBytes("openai-resp", "incoming /v1/responses request", bodyBytes)
 
 		var req OpenAIResponsesRequest
@@ -795,7 +830,9 @@ func streamAnthropicAsOpenAIChat(w http.ResponseWriter, r *http.Request, anthrop
 	}
 	transcoder := newOpenAIChatStreamTranscoder(w, flusher, responseID, anthropicReq.Model, created, includeUsage)
 	headersSent := false
+	frameCount := 0
 	for raw := range bridge.frames {
+		frameCount++
 		if bridge.Status() != http.StatusOK {
 			continue
 		}
@@ -817,6 +854,7 @@ func streamAnthropicAsOpenAIChat(w http.ResponseWriter, r *http.Request, anthrop
 		}
 	}
 
+	log.Printf("[openai-chat] stream complete: %d frames, bridge status=%d", frameCount, bridge.Status())
 	if bridge.Status() != http.StatusOK {
 		invErr := parseAnthropicInvocationError(bridge.Status(), bridge.ErrorBody())
 		writeOpenAIError(w, invErr.Status, invErr.Message, invErr.Type, "")
@@ -842,14 +880,21 @@ func streamAnthropicAsOpenAIResponses(w http.ResponseWriter, r *http.Request, an
 	}
 	transcoder := newOpenAIResponsesStreamTranscoder(w, flusher, responseID, anthropicReq.Model, created)
 	headersSent := false
+	frameCount := 0
 	for raw := range bridge.frames {
+		frameCount++
 		if bridge.Status() != http.StatusOK {
+			log.Printf("[openai-resp] skipping frame %d (bridge status=%d)", frameCount, bridge.Status())
 			continue
 		}
 		frame, err := parseAnthropicSSEFrame(raw)
 		if err != nil {
+			log.Printf("[openai-resp] frame %d parse error: %v", frameCount, err)
 			writeOpenAIError(w, http.StatusBadGateway, "failed to parse Anthropic stream: "+err.Error(), "api_error", "")
 			return
+		}
+		if DebugLoggingEnabled() {
+			log.Printf("[openai-resp] frame %d: event=%s", frameCount, frame.Event)
 		}
 		if !headersSent {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -859,11 +904,14 @@ func streamAnthropicAsOpenAIResponses(w http.ResponseWriter, r *http.Request, an
 			headersSent = true
 		}
 		if err := transcoder.HandleFrame(frame); err != nil {
+			log.Printf("[openai-resp] frame %d transcode error: %v", frameCount, err)
 			writeOpenAIError(w, http.StatusBadGateway, "failed to map Anthropic stream: "+err.Error(), "api_error", "")
 			return
 		}
 	}
 
+	log.Printf("[openai-resp] stream complete: %d frames, bridge status=%d, text=%d chars",
+		frameCount, bridge.Status(), transcoder.messageText.Len())
 	if bridge.Status() != http.StatusOK {
 		invErr := parseAnthropicInvocationError(bridge.Status(), bridge.ErrorBody())
 		writeOpenAIError(w, invErr.Status, invErr.Message, invErr.Type, "")

@@ -189,16 +189,26 @@ func TestOpenAIResponsesStreamTranscoder_EmitsCompletedResponse(t *testing.T) {
 		}
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "event: response.created") {
-		t.Fatalf("missing response.created: %s", body)
+	for _, required := range []string{
+		"event: response.created",
+		"event: response.in_progress",
+		"event: response.output_item.added",
+		"event: response.content_part.added",
+		"event: response.output_text.delta",
+		"event: response.output_text.done",
+		"event: response.content_part.done",
+		"event: response.output_item.done",
+		"event: response.function_call_arguments.delta",
+		"event: response.completed",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("missing %s in body:\n%s", required, body)
+		}
 	}
-	if !strings.Contains(body, "event: response.output_text.delta") || !strings.Contains(body, "你好") {
-		t.Fatalf("missing text delta: %s", body)
+	if !strings.Contains(body, "你好") {
+		t.Fatalf("missing text content: %s", body)
 	}
-	if !strings.Contains(body, "event: response.function_call_arguments.delta") || !strings.Contains(body, `a.txt`) {
-		t.Fatalf("missing function_call_arguments.delta: %s", body)
-	}
-	if !strings.Contains(body, "event: response.completed") {
-		t.Fatalf("missing response.completed: %s", body)
+	if !strings.Contains(body, `a.txt`) {
+		t.Fatalf("missing function call arguments: %s", body)
 	}
 }
