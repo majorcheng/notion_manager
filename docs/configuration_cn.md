@@ -14,7 +14,7 @@
 | --- | --- | --- | --- |
 | `server.port` | `3000` | `8081` | 文档示例默认按仓库样例的 `3000` 编写 |
 | `server.accounts_dir` | `accounts` | `accounts` | 账号 JSON 目录 |
-| `server.api_key` | 空 | 自动生成 | 仅用于 `/v1/messages` 等 API Key 保护接口 |
+| `server.api_key` | 空 | 自动生成 | 用于 `/v1/messages`、`/v1/chat/completions`、`/v1/responses`、`/v1/models`、`/models` 等 API Key 保护接口 |
 | `server.admin_password` | 空 | 自动生成 | 留空时自动生成；首次启动后哈希回写 |
 | `server.debug_logging` | `true` | `true` | 控制高频调试日志 |
 | `proxy.default_model` | `opus-4.6` | `opus-4.6` | 请求未传 `model` 时的回退模型 |
@@ -43,6 +43,8 @@ export ENABLE_WORKSPACE_SEARCH=false
 | `POST /v1/messages` | Anthropic Messages API | API Key |
 | `POST /v1/chat/completions` | OpenAI Chat Completions API | API Key |
 | `POST /v1/responses` | OpenAI Responses API | API Key |
+| `GET /v1/models` | OpenAI Models API | API Key |
+| `GET /models` | `/v1/models` 的兼容别名 | API Key |
 | `GET /dashboard/` | 管理面板 | Dashboard 登录 |
 | `GET /proxy/start` | 为选定账号创建代理会话 | Dashboard 登录 |
 | `GET /ai` | Notion Web 代理入口 | `np_session` |

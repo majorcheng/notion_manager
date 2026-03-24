@@ -30,11 +30,11 @@
   <img src="img/dashboard.png" alt="Dashboard" width="900">
 </p>
 
-**notion-manager** 是一个本地运行的 Notion AI 管理工具。构建多账号池，后台自动刷新额度与模型，对外提供三个入口：
+**notion-manager** 是一个本地运行的 Notion AI 管理工具。构建多账号池，后台自动刷新额度与模型，对外提供四个入口：
 
 - **Dashboard** `/dashboard/` — 管理账号、查看额度、切换设置
 - **Reverse Proxy** `/ai` — 本地使用完整 Notion AI 页面
-- **API 网关** `POST /v1/messages`、`POST /v1/chat/completions`、`POST /v1/responses` — 同时兼容 Anthropic 与 OpenAI 风格客户端
+- **API 网关** `POST /v1/messages`、`POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/models`（`GET /models` 为兼容别名）— 同时兼容 Anthropic 与 OpenAI 风格客户端
 
 ## 快速开始
 
@@ -108,6 +108,8 @@ export OPENAI_API_KEY=<your-api-key>
 - `POST /v1/messages` — Anthropic Messages API
 - `POST /v1/chat/completions` — OpenAI Chat Completions API
 - `POST /v1/responses` — OpenAI Responses API
+- `GET /v1/models` — OpenAI Models API
+- `GET /models` — `/v1/models` 的兼容别名
 - 同时支持 `Authorization: Bearer <api_key>` 和 `x-api-key: <api_key>`
 - 支持流式与非流式响应
 - 同时支持 Anthropic `tools` 与 OpenAI `tools` / `function_call`

@@ -30,11 +30,11 @@
   <img src="img/dashboard.png" alt="Dashboard" width="900">
 </p>
 
-**notion-manager** is a local Notion AI management tool. It builds a multi-account pool, refreshes quota and model state in the background, and exposes three entrypoints:
+**notion-manager** is a local Notion AI management tool. It builds a multi-account pool, refreshes quota and model state in the background, and exposes four entrypoints:
 
 - **Dashboard** at `/dashboard/` — manage accounts, view quota, toggle settings
 - **Reverse Proxy** at `/ai` — full Notion AI web UI with pooled accounts
-- **API gateway** at `POST /v1/messages`, `POST /v1/chat/completions`, and `POST /v1/responses` — compatible with Anthropic and OpenAI-style clients
+- **API gateway** at `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`, and `GET /v1/models` (`GET /models` alias) — compatible with Anthropic and OpenAI-style clients
 
 ## Quick Start
 
@@ -108,6 +108,8 @@ Or download a pre-built binary from [Releases](https://github.com/SleepingBag945
 - `POST /v1/messages` — Anthropic Messages API
 - `POST /v1/chat/completions` — OpenAI Chat Completions API
 - `POST /v1/responses` — OpenAI Responses API
+- `GET /v1/models` — OpenAI models API
+- `GET /models` — compatibility alias for `/v1/models`
 - Supports both `Authorization: Bearer <api_key>` and `x-api-key: <api_key>`
 - Streaming and non-streaming responses
 - Anthropic `tools` and OpenAI `tools` / `function_call`

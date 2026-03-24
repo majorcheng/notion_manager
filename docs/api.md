@@ -7,8 +7,10 @@
 - `POST /v1/messages` — Anthropic Messages API
 - `POST /v1/chat/completions` — OpenAI Chat Completions API
 - `POST /v1/responses` — OpenAI Responses API
+- `GET /v1/models` — OpenAI models API
+- `GET /models` — compatibility alias for `/v1/models`
 
-All three routes reuse the same multi-account pool, file upload pipeline, tool bridge, and failover logic.
+All of these routes reuse the same multi-account pool, file upload pipeline, tool bridge, and failover logic.
 
 `/v1/responses` is currently stateless, so `previous_response_id` is not supported.
 
@@ -30,6 +32,17 @@ curl http://localhost:3000/v1/messages \
 ```
 
 If `model` is omitted, the service falls back to `proxy.default_model`.
+
+## OpenAI Models request
+
+```bash
+curl http://localhost:3000/v1/models \
+  -H "Authorization: Bearer <api_key>"
+```
+
+The response returns normalized friendly model IDs that can be passed back into `/v1/chat/completions`, `/v1/responses`, or `/v1/messages`.
+
+`GET /models` returns the same payload for clients that probe the bare root alias.
 
 ## OpenAI Chat Completions request
 

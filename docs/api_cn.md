@@ -7,8 +7,10 @@
 - `POST /v1/messages` — Anthropic Messages API
 - `POST /v1/chat/completions` — OpenAI Chat Completions API
 - `POST /v1/responses` — OpenAI Responses API
+- `GET /v1/models` — OpenAI Models API
+- `GET /models` — `/v1/models` 的兼容别名
 
-三条路由共用同一套多账号池、文件上传链路、工具桥接和失败切换逻辑。
+这些路由共用同一套多账号池、文件上传链路、工具桥接和失败切换逻辑。
 
 当前 `/v1/responses` 是无状态桥接，因此暂不支持 `previous_response_id`。
 
@@ -30,6 +32,17 @@ curl http://localhost:3000/v1/messages \
 ```
 
 如果不传 `model`，会自动使用 `proxy.default_model`。
+
+## OpenAI Models 基本请求
+
+```bash
+curl http://localhost:3000/v1/models \
+  -H "Authorization: Bearer <api_key>"
+```
+
+返回结果里的模型 ID 都是归一化后的友好名称，可直接继续传给 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`。
+
+`GET /models` 会返回相同 payload，兼容某些直接探测根路径的客户端。
 
 ## OpenAI Chat Completions 基本请求
 

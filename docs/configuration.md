@@ -14,7 +14,7 @@ environment variables > config.yaml > code defaults
 | --- | --- | --- | --- |
 | `server.port` | `3000` | `8081` | This README uses the checked-in sample port |
 | `server.accounts_dir` | `accounts` | `accounts` | Account JSON directory |
-| `server.api_key` | empty | auto-generated | Used for API-key protected endpoints |
+| `server.api_key` | empty | auto-generated | Used for `/v1/messages`, `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/models`, and other API-key protected endpoints |
 | `server.admin_password` | empty | auto-generated | Auto-generated if empty; hashed on first startup |
 | `server.debug_logging` | `true` | `true` | High-volume debug logging |
 | `proxy.default_model` | `opus-4.6` | `opus-4.6` | Fallback model |
@@ -34,6 +34,8 @@ environment variables > config.yaml > code defaults
 | `POST /v1/messages` | Anthropic Messages API | API key |
 | `POST /v1/chat/completions` | OpenAI Chat Completions API | API key |
 | `POST /v1/responses` | OpenAI Responses API | API key |
+| `GET /v1/models` | OpenAI models API | API key |
+| `GET /models` | Compatibility alias for `/v1/models` | API key |
 | `GET /dashboard/` | Dashboard UI | Dashboard login |
 | `GET /proxy/start` | Create a targeted proxy session | Dashboard login |
 | `GET /ai` | Local Notion Web proxy entry | `np_session` |
