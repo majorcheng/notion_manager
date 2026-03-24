@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -384,14 +385,136 @@ func sanitizeForBridge(messages []ChatMessage) []ChatMessage {
 // - <local-command-caveat>: contains "DO NOT respond" which kills the response
 // - Inline tags like <command-name>/clear</command-name>
 var (
-	blockTagRegex  = regexp.MustCompile(`(?s)<(?:system-reminder|local-command-caveat)>.*?</(?:system-reminder|local-command-caveat)>`)
-	inlineTagRegex = regexp.MustCompile(`<[a-z][-a-z]*>[^<]*</[a-z][-a-z]*>`)
+	blockTagRegex        = regexp.MustCompile(`(?s)<(?:system-reminder|local-command-caveat)>.*?</(?:system-reminder|local-command-caveat)>`)
+	inlineTagRegex       = regexp.MustCompile(`<[a-z][-a-z]*>[^<]*</[a-z][-a-z]*>`)
+	cwdXMLRegex          = regexp.MustCompile(`<cwd>([^<]+)</cwd>`)
+	pwdCommandRegex      = regexp.MustCompile(`(?m)^% pwd\s*\n([^\n]+)`)
+	bareFilenameRegex    = regexp.MustCompile(`^[A-Za-z0-9._ -]+\.[A-Za-z0-9]{1,16}$`)
+	absolutePathErrRegex = regexp.MustCompile(`(?i)absolute path|absolute file path|must be absolute|绝对路径`)
 )
 
 func stripSystemReminders(content string) string {
 	content = blockTagRegex.ReplaceAllString(content, "")
 	content = inlineTagRegex.ReplaceAllString(content, "")
 	return strings.TrimSpace(content)
+}
+
+func extractWorkingDirectoryFromText(content string) string {
+	if match := cwdXMLRegex.FindStringSubmatch(content); len(match) >= 2 {
+		return strings.TrimSpace(match[1])
+	}
+	if match := pwdCommandRegex.FindStringSubmatch(content); len(match) >= 2 {
+		return strings.TrimSpace(match[1])
+	}
+	return ""
+}
+
+func extractWorkingDirectoryFromMessages(messages []ChatMessage) string {
+	for _, msg := range messages {
+		if msg.Role == "system" {
+			if cwd := extractWorkingDirectoryFromText(msg.Content); cwd != "" {
+				return cwd
+			}
+		}
+	}
+	for _, msg := range messages {
+		if cwd := extractWorkingDirectoryFromText(msg.Content); cwd != "" {
+			return cwd
+		}
+	}
+	return ""
+}
+
+func hasReadAbsolutePathFailure(messages []ChatMessage) bool {
+	for _, msg := range messages {
+		if msg.Role != "tool" || msg.Name != "Read" {
+			continue
+		}
+		if absolutePathErrRegex.MatchString(msg.Content) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeResolvedPath(candidate string) bool {
+	if candidate == "" {
+		return false
+	}
+	if strings.ContainsAny(candidate, "<>{}[]\t") {
+		return false
+	}
+	if strings.HasPrefix(candidate, "/") || strings.HasPrefix(candidate, "./") || strings.HasPrefix(candidate, "../") {
+		return true
+	}
+	if strings.Contains(candidate, "/") {
+		return true
+	}
+	return bareFilenameRegex.MatchString(candidate)
+}
+
+func extractSinglePathCandidate(content string) (string, bool) {
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	var candidates []string
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		line = strings.TrimLeft(line, "-*• ")
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "found ") || strings.HasPrefix(lower, "matches:") {
+			continue
+		}
+		if strings.Contains(line, ":") && !strings.HasPrefix(line, "./") && !strings.HasPrefix(line, "../") && !strings.HasPrefix(line, "/") {
+			return "", false
+		}
+		if !looksLikeResolvedPath(line) {
+			return "", false
+		}
+		candidates = append(candidates, line)
+	}
+	if len(candidates) != 1 {
+		return "", false
+	}
+	return candidates[0], true
+}
+
+func buildReadRetryGuidance(messages []ChatMessage, lastAssistantIdx int, cwd string, resolveName func(ChatMessage) string) string {
+	if cwd == "" || !hasReadAbsolutePathFailure(messages) {
+		return ""
+	}
+
+	for i, msg := range messages {
+		if msg.Role != "tool" || i <= lastAssistantIdx {
+			continue
+		}
+		toolName := resolveName(msg)
+		if toolName != "Grep" && toolName != "Glob" {
+			continue
+		}
+		pathCandidate, ok := extractSinglePathCandidate(msg.Content)
+		if !ok {
+			continue
+		}
+		absolutePath := pathCandidate
+		if !filepath.IsAbs(absolutePath) {
+			absolutePath = filepath.Clean(filepath.Join(cwd, pathCandidate))
+		}
+		call := map[string]interface{}{
+			"name": "Read",
+			"arguments": map[string]interface{}{
+				"file_path": absolutePath,
+			},
+		}
+		payload, _ := json.Marshal(call)
+		return fmt.Sprintf(
+			"Path recovery hint: the previous Read failed because it required an absolute path. The latest %s result looks like a file path, not file contents (%s). Do NOT use __done__ yet. Prefer this next call:\n%s\n",
+			toolName, pathCandidate, string(payload),
+		)
+	}
+
+	return ""
 }
 
 // isSuggestionMode detects Claude Code's Prompt Suggestion Generator requests.
@@ -511,20 +634,18 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 			}
 		}
 
-		// Extract CWD from system prompt before dropping it.
-		// CC uses <cwd>/path/to/dir</cwd> in its system prompt.
-		var extractedCwd string
-		cwdRe := regexp.MustCompile(`<cwd>([^<]+)</cwd>`)
+		// Extract CWD from the incoming context before dropping system reminders.
+		// Claude Code uses <cwd>...</cwd>; Droid sessions often expose `% pwd`.
+		extractedCwd := extractWorkingDirectoryFromMessages(messages)
+		if extractedCwd != "" {
+			log.Printf("[bridge] extracted CWD from context: %s", extractedCwd)
+		}
 
 		// Drop system messages — Notion's 27k prompt dominates; ours just adds
 		// confusing meta-instructions when buildTranscript merges it into user msg
 		var filtered []ChatMessage
 		for _, m := range messages {
 			if m.Role == "system" {
-				if match := cwdRe.FindStringSubmatch(m.Content); len(match) >= 2 {
-					extractedCwd = match[1]
-					log.Printf("[bridge] extracted CWD from system prompt: %s", extractedCwd)
-				}
 				log.Printf("[bridge] dropped system message (%d chars)", len(m.Content))
 			} else if m.Role == "user" && strings.TrimSpace(m.Content) == "" && m.ToolCallID == "" && len(m.ToolCalls) == 0 {
 				log.Printf("[bridge] dropped empty wrapper-only user message after sanitization")
@@ -664,9 +785,10 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 			if needsReadNarrowing {
 				readGuardLine = "The previous Read call was too large. Do NOT repeat the same full-file Read. Use Grep to narrow scope or call Read with both offset and limit.\n"
 			}
+			readRetryLine := buildReadRetryGuidance(messages, lastAssistantIdx, extractedCwd, resolveName)
 			collapsed := fmt.Sprintf(
-				"I'm writing a unit test for an API router.\n%s%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\n\nAlready executed (do NOT re-run):\n%s\n\nInput: \"%s\"\n\nIf the results above answer the input, output: {\"name\": \"__done__\", \"arguments\": {\"result\": \"natural language answer based on results\"}}\nOtherwise output the JSON for the NEXT DIFFERENT function call.",
-				cwdLine, readGuardLine, compactList, dataStr, userQuery)
+				"I'm writing a unit test for an API router.\n%s%s%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\n\nAlready executed (do NOT re-run):\n%s\n\nInput: \"%s\"\n\nIf the results above answer the input, output: {\"name\": \"__done__\", \"arguments\": {\"result\": \"natural language answer based on results\"}}\nOtherwise output the JSON for the NEXT DIFFERENT function call.",
+				cwdLine, readGuardLine, readRetryLine, compactList, dataStr, userQuery)
 			log.Printf("[bridge] chain: collapsed %d messages to single message (%d chars)", len(messages), len(collapsed))
 			return []ChatMessage{{Role: "user", Content: collapsed}}
 		}
@@ -924,6 +1046,10 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 // context from previous turns (the original "unit test" framing, the model's JSON
 // response, etc.). The follow-up is sent as a partial transcript via CallInference.
 func buildSessionChainFollowUp(messages []ChatMessage, compactList string, cwd string) []ChatMessage {
+	if cwd == "" {
+		cwd = extractWorkingDirectoryFromMessages(messages)
+	}
+
 	// Build tool call ID → name map
 	tcMap := make(map[string]string)
 	for _, m := range messages {
@@ -983,10 +1109,11 @@ func buildSessionChainFollowUp(messages []ChatMessage, compactList string, cwd s
 	if needsReadNarrowing {
 		readGuardLine = "The previous Read call was too large. Do NOT repeat the same full-file Read. Use Grep to narrow scope or call Read with both offset and limit.\n"
 	}
+	readRetryLine := buildReadRetryGuidance(messages, lastAssistantIdx, cwd, resolveName)
 
 	followUp := fmt.Sprintf(
-		"Results from executed function(s):\n%s\n\n%s%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nIf these results answer the question, use __done__. Otherwise output the next function call.",
-		results.String(), cwdLine, readGuardLine, compactList)
+		"Results from executed function(s):\n%s\n\n%s%s%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nIf these results answer the question, use __done__. Otherwise output the next function call.",
+		results.String(), cwdLine, readGuardLine, readRetryLine, compactList)
 
 	log.Printf("[bridge] session chain: follow-up for partial transcript (%d chars, %d tool results)",
 		len(followUp), resultCount)
